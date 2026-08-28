@@ -1113,10 +1113,7 @@ Let, sigma_0 = sigma_1 = sqrt(omega/(1-alphas-beta))
 
 ```{r}
 sigma_0 = sqrt(omega/(1-alpha1-beta1)) #alpha2-
-sigma_1 = sigma_0
-  
 f_0 = sigma_0 * z_sim[1,]
-f_1 = sigma_1 * z_sim[2,]
 ```
 
 ```{r}
@@ -1160,8 +1157,6 @@ round(best_model@mfit$arcoef,3)
 ```
 
 ```{r}
-#x_sim = f_sim %*% t(A)
-
 eps_sim <- f_sim %*% t(A)
 
 mu <- best_model@mfit$arcoef["mu",]
@@ -1186,19 +1181,6 @@ for(t in 2:nrow(eps_sim)){
 dim(x_sim_ar)
 ```
 
-```{r}
-w <- rep(1/10, 10)
-
-portfolio_return <- x_sim_ar[(burn_in+1):nrow(x_sim_ar),] %*% w
-portfolio_return <- as.vector(portfolio_return)
-
-VaR_95 <- -unname(quantile(portfolio_return, 0.05))
-VaR_99 <- -unname(quantile(portfolio_return, 0.01))
-
-print(VaR_95)
-print(VaR_99)
-```
-
 ## Validation
 
 ```{r}
@@ -1212,7 +1194,7 @@ round(cor_matrix, 4)
 
 ```{r}
 #GO-GARCH + Vine-Copula Simulation 
-cor_Xsim <- cor(x_sim_ar[(burn_in+1):nrow(x_sim_ar),], use = "pairwise.complete.obs")
+cor_Xsim <- cor(x_sim_ar[10001:2e4,], use = "pairwise.complete.obs")
 ```
 
 ```{r}
@@ -1302,13 +1284,19 @@ corrplot(
 
 ```
 
+### Mean Squared Error
+
+```{r}
+
+```
+
+### Apply "Z" values from gogarchsim into manually generated function
+
 ```{r}
 F_garchsim <- sim_model@msim$factor.residSim[[1]]
 sigma_garchsim <- sim_model@msim$factor.sigmaSim[[1]]
 Z_garchsim <- F_garchsim / sigma_garchsim
 ```
-
-### Apply "Z" values from gogarchsim into manually generated function
 
 ```{r}
 sigma_0 = sigma_garchsim[1, ] #sqrt(omega/(1-alpha1-beta1)) #alpha2
@@ -1371,4 +1359,1119 @@ summary(x_sim_ar_v[10001:2e4,] - x_sim_gogarch)
 
 ```{r}
 all.equal(x_sim_ar_v[10001:20000,], x_sim_gogarch)
+```
+
+# Tail Risk: VaR, ES 
+
+```{r}
+
+dim(x_sim_ar)
+dim(x_sim_gogarch)
+dim(df_filtered)
+```
+
+```{r}
+# 1. Define portfolio weights
+w <- rep(1/10, 10)
+
+# 2. Create list of returns datasets
+data_list <- list(
+  "Observed"   = exp(df_filtered) - 1,
+  "GO-GARCH"   = exp(x_sim_gogarch) - 1,
+    "gogarch+vc"     = exp(x_sim_ar[(burn_in + 1):nrow(x_sim_ar), ])-1
+  ) #exp(sim_results$x_sim) - 
+
+# 3. Define function to compute VaR and ES
+calc_risk_metrics <- function(ret_matrix, weights) {
+  # Calculate portfolio return series
+  port_ret <- as.vector(as.matrix(ret_matrix) %*% weights)
+  
+  # Compute quantiles at 5% and 1% levels
+  q95 <- unname(quantile(port_ret, 0.05))
+  q99 <- unname(quantile(port_ret, 0.01))
+  
+  # Compute VaR & ES (expressed as positive loss values)
+  data.frame(
+    VaR_95 = -q95,
+    VaR_99 = -q99,
+    ES_95  = -mean(port_ret[port_ret <= q95]),
+    ES_99  = -mean(port_ret[port_ret <= q99])
+  )
+}
+
+# 4. Apply metric function across datasets and row-bind into summary table
+results_list <- lapply(data_list, calc_risk_metrics, weights = w)
+results_df <- do.call(rbind, results_list)
+
+# Display final table
+print(results_df)
+```
+
+# Extra works...!
+
+## For repetitive works, Generate Functions...
+
+```{r}
+go_garch_conditions
+```
+
+### gogarch_optim
+
+```{r}
+gogarch_optim = function(go_garch_conditions, df){
+  k <- nrow(go_garch_conditions)
+  fits <- vector("list", k)
+
+  for (i in 1:k) {
+    set.seed(4595440)
+    mean_model = go_garch_conditions$mean_model[i]
+    p = go_garch_conditions$p[i]
+    q = go_garch_conditions$q[i]
+    dist = as.character(go_garch_conditions$dist[i])
+    ica = as.character(go_garch_conditions$ica[i])
+    
+    spec <- gogarchspec(
+      mean.model = list(model = mean_model, lag = 1),
+      variance.model = list(model = "sGARCH", garchOrder = c(p,q)),
+      distribution.model = dist,
+      ica = ica
+      )
+  
+    tryCatch({  
+      fits[[i]] <- gogarchfit(spec, data = df)
+    
+    }, error = function(e){
+      fits[[i]] <<-NA
+    })
+    
+  }
+  
+  names(fits) <- paste0("fit", 1:k)
+  
+  ll_values <- sapply(fits, function(x) {
+  if (is.null(x) || !inherits(x, "goGARCHfit")) {
+    return(NA)
+    } else {
+    return(as.numeric(likelihood(x)))
+    }
+  })
+
+  #AIC values
+  AIC_values <- sapply(fits, function(x) {
+    if (is.null(x) || !inherits(x, "goGARCHfit")) {
+      return(NA)
+    } else {
+      ll <- likelihood(x)
+      k  <- length(coef(x))
+      AIC <- -2*ll + 2*k
+      return(as.numeric(AIC))
+    }
+  })
+
+  go_garch_conditions$ll <- ll_values
+  go_garch_conditions$AIC <- AIC_values
+  
+  LB_results <- lapply(fits, function(x){
+  if (!inherits(x,"goGARCHfit")){
+    return(NULL)
+  }
+  ljung_box_test(x, df)
+  })
+  
+  go_garch_conditions$LB_raw_pass <- sapply(LB_results, function(x){
+    if(is.null(x)) return(NA)
+    sum(x$raw > 0.05)
+  })
+  
+  go_garch_conditions$LB_squared_pass <- sapply(LB_results, function(x){
+    if(is.null(x)) return(NA)
+    sum(x$squared > 0.05)
+  })
+  
+  valid_idx <- which(!is.na(AIC_values))
+  sorted_idx <- valid_idx[order(AIC_values[valid_idx], decreasing = FALSE)]
+  top10 <- sorted_idx[1:10]
+  results_top10 = go_garch_conditions[top10,]
+ 
+  return(list(
+    result = go_garch_conditions,
+    result_top10 = results_top10,
+    fits = fits
+  ))
+}
+```
+
+### Lijung-Box test result
+
+```{r}
+lb_test <- function(fitted_model, df){
+  
+
+  best_model = fitted_model
+  R <- as.matrix(df)
+  X <- R - best_model@mfit$mu
+  W <- best_model@mfit$W
+  F <- X %*% t(W)
+
+  # conditional sigma of factors
+  sigma_f <- best_model@mfit$factor.sigmas 
+
+  # standardized innovations
+  Z <- F / sigma_f
+  
+  lb_results <- data.frame(
+    Factor = integer(),
+    LB_raw = numeric(),
+    p_raw = numeric(),
+    LB_squared = numeric(),
+    p_squared = numeric()
+  )
+
+  for(i in 1:ncol(Z)){
+  
+    raw_test <- Box.test(
+      Z[, i],
+      lag = 20,
+      type = "Ljung-Box"
+    )
+    
+    sq_test <- Box.test(
+      Z[, i]^2,
+      lag = 20,
+      type = "Ljung-Box"
+    )
+    
+    lb_results <- rbind(
+      lb_results,
+      data.frame(
+        Factor = i,
+        LB_raw = raw_test$statistic,
+        p_raw = raw_test$p.value,
+        LB_squared = sq_test$statistic,
+        p_squared = sq_test$p.value
+      )
+    )
+  }
+  
+  return(lb_results)
+  
+}
+```
+
+### Simulation
+
+```{r}
+#only  AR mean model + GARCH(1,1) for now...
+ggvc_sim <- function(fitted_model, df, burn_in = 1e4, N = 2e4) {
+  
+  best_model <- fitted_model
+  R <- as.matrix(df)
+  
+  # 1. GO-GARCH
+  X <- R - best_model@mfit$mu
+  W <- best_model@mfit$W
+  F_factor <- X %*% t(W)
+  sigma_f  <- best_model@mfit$factor.sigmas 
+  Z        <- F_factor / sigma_f
+  
+  # 2. Vine Copula
+  u_uni    <- as.matrix(pobs(Z))
+  vine_fit <- RVineStructureSelect(u_uni)  
+  
+  set.seed(4595440)
+  u_sim <- RVineSim(N, vine_fit)
+
+  # Quantile
+  z_sim <- sapply(1:ncol(u_sim), function(k) {
+    quantile(Z[, k], probs = u_sim[, k], type = 8)
+  })  
+
+  # 3.  GARCH simulation
+  m <- ncol(z_sim)
+  
+  sigma_sim <- matrix(NA, nrow = N, ncol = m)
+  f_sim     <- matrix(NA, nrow = N, ncol = m)
+  
+  omega = coef(best_model)["omega", ]
+  alpha1 = coef(best_model)["alpha1", ]
+  beta1 = coef(best_model)["beta1", ]
+  
+  sigma_0 = sqrt(omega/(1-alpha1 - beta1))   
+  f_0 = sigma_0 * z_sim[1,]
+  
+  
+  sigma_sim[1, ] <- sigma_0
+  f_sim[1, ] <- f_0
+  
+  for(i in 2:nrow(z_sim)){
+  
+    sigma_square <-
+      omega +
+      alpha1 * f_sim[i-1, ]^2 +
+      beta1  * sigma_sim[i-1, ]^2
+  
+    sigma_sim[i, ] <- sqrt(sigma_square)
+  
+    f_sim[i, ] <- sigma_sim[i, ] * z_sim[i, ]
+  }
+  
+
+  # 4. Mixing Matrix A
+  A <- best_model@mfit$A
+  eps_sim <- f_sim %*% t(A)
+
+  # 5. Flexible AR/Mean Structure
+  ar_coefs <- best_model@mfit$arcoef
+  mu_vec   <- ar_coefs["mu", ]
+  
+  # AR(1) 
+  has_ar1  <- "ar1" %in% rownames(ar_coefs)
+  phi_vec  <- if(has_ar1) ar_coefs["ar1", ] else rep(0, ncol(df))
+
+  x_sim_ar <- matrix(NA, nrow = N, ncol = ncol(df))
+  
+  #initial value
+  x_sim_ar[1, ] <- (1 - phi_vec) * mu_vec + eps_sim[1, ]
+
+  # AR(1) 
+  for (t in 2:N) {
+    x_sim_ar[t, ] <- (1 - phi_vec) * mu_vec +
+                     phi_vec * x_sim_ar[t - 1, ] +
+                     eps_sim[t, ]
+  }
+  
+  sim_model <- gogarchsim(best_model, 
+                        startMethod="unconditional", 
+                        n.sim=2e4, n.start=0, m.sim=1,
+                        presigma = matrix(sigma_0, ncol = 1),
+                        rseed = 4595440)
+
+  x_sim_gogarch <- sim_model@msim$seriesSim[[1]][10001:20000, ]
+
+
+  return(list(
+    x_sim     = x_sim_ar[10001:20000, ],
+    sigma_sim = sigma_sim,    
+    f_sim     = f_sim,        
+    vine_fit  = vine_fit,
+    x_sim_gogarch = x_sim_gogarch,
+    gogarchsim_model = sim_model
+
+  ))
+}
+
+```
+
+### Correlation Matrix
+
+```{r}
+cor_function = function(x_sim, x_raw){
+  
+  cor_Xsim = cor(x_sim, use = "pairwise.complete.obs")
+  cor_Xraw = cor(x_raw, use = "pairwise.complete.obs")
+  
+  mse = mean((cor_Xsim[upper.tri(cor_Xsim)] - cor_Xraw[upper.tri(cor_Xraw)])^2)
+  mae = mean(abs(cor_Xsim[upper.tri(cor_Xsim)] - cor_Xraw[upper.tri(cor_Xraw)]))
+  return(list(
+    rmse = sqrt(mse),
+    mae = mae,
+    cor_Xsim = cor_Xsim,
+    cor_Xraw = cor_Xraw
+  ))
+  
+}
+```
+
+```{r}
+
+corrplot_save = function(filename, cor_matrix, asset_name = asset_list){
+  
+  colnames(cor_matrix) = asset_name
+  rownames(cor_matrix) = asset_name
+  file_path <- paste0("plots/", filename, ".png")
+  
+  png(
+  filename = file_path,
+  width = 1800,
+  height = 1600,
+  res = 200
+)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 45,
+  diag = FALSE,
+
+  tl.cex = 1.5,        # ticker label 
+  number.cex = 1.5,    # correlation value
+  cl.cex = 1.5         # legend (color bar)
+)
+
+dev.off()
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 45,
+  diag = FALSE,
+
+ )
+  
+}
+```
+
+```{r}
+#test
+go_optim_test = gogarch_optim(go_garch_conditions[49,], df_filtered)
+lb_test(go_optim_test$fits[[1]], df_filtered)
+```
+
+```{r}
+sim_results = ggvc_sim(go_optim_test$fits[[1]], df_filtered)
+```
+
+```{r}
+cor_function(sim_results$x_sim_gogarch, df_filtered)
+cor_function(sim_results$x_sim, df_filtered)
+```
+
+```{r}
+corrplot_save("correlation_matrix_sim", cor_function(sim_results$x_sim, df_filtered)$cor_Xsim)
+```
+
+## Without Stable Coins..... 
+
+```{r}
+target_cols <- c("Close_BTC", "Close_ADA", "Close_BNB", "Close_DOGE", 
+                 "Close_ETH", "Close_SOL", "Close_STETH", "Close_XRP")
+
+df_8assets <- df_filtered[, target_cols]
+```
+
+```{r}
+colnames(df_8assets)
+```
+
+```{r}
+go_optim_8a = gogarch_optim(go_garch_conditions, df_8assets)
+fits_8a = go_optim_8a$fits 
+```
+
+```{r}
+go_optim_8a$result_top10
+```
+
+```{r}
+best_model_8a = fits_8a[[49]]
+
+```
+
+```{r}
+lb_test(best_model_8a, df_8assets)
+```
+
+```{r}
+#fits_8a = go_optim_8a$fits 
+sim_results_8a = ggvc_sim(best_model_8a, df_8assets)
+cor_function(sim_results_8a$x_sim_gogarch, df_8assets)
+cor_function(sim_results_8a$x_sim, df_8assets)
+```
+
+```{r}
+
+asset_8 = c("BTC", "ADA", "BNB", "DOGE", "ETH", "SOL", "STETH", "XRP")  
+  
+corrplot_save("correlation_matrix_df_8a_sim", 
+              cor_function(sim_results_8a$x_sim, df_8assets)$cor_Xsim,
+              asset_name =asset_8)
+corrplot_save("correlation_matrix_df_8a_raw", 
+              cor_function(sim_results_8a$x_sim, df_8assets)$cor_Xraw,
+              asset_name =asset_8)
+corrplot_save("correlation_matrix_df_8a_gogarchsim", 
+              cor_function(sim_results_8a$x_sim_gogarch, df_8assets)$cor_Xsim,
+              asset_name =asset_8)
+```
+
+## Market Stress Period
+
+```{r}
+dates <- as.Date(rownames(df_filtered))
+
+df_pre    <- df_filtered[dates >= as.Date("2020-12-24") & dates <= as.Date("2021-04-02"), ]
+df_cri <- df_filtered[dates >= as.Date("2021-03-25") & dates <= as.Date("2021-07-05"), ]
+df_pos   <- df_filtered[dates >= as.Date("2021-07-01") & dates <= as.Date("2021-10-31"), ]
+```
+
+```{r}
+go_optim_pre = gogarch_optim(go_garch_conditions[49,], df_pre)
+lb_test(go_optim_pre$fits[[1]], df_pre)
+
+sim_results_pre = ggvc_sim(go_optim_pre$fits[[1]], df_pre)
+cor_function(sim_results_pre$x_sim_gogarch, df_pre)
+cor_function(sim_results_pre$x_sim, df_pre)
+#corrplot_save("correlation_matrix_sim", cor_function(sim_results$x_sim, df_filtered)$cor_Xsim)
+```
+
+```{r}
+corrplot_save("correlation_matrix_df_pre_sim", cor_function(sim_results_pre$x_sim, df_pre)$cor_Xsim)
+corrplot_save("correlation_matrix_df_pre_raw", cor_function(sim_results_pre$x_sim, df_pre)$cor_Xraw)
+corrplot_save("correlation_matrix_df_pre_gogarchsim", cor_function(sim_results_pre$x_sim_gogarch, df_pre)$cor_Xsim)
+```
+
+```{r}
+go_optim_cri = gogarch_optim(go_garch_conditions[49,], df_cri)
+lb_test(go_optim_cri$fits[[1]], df_cri)
+
+sim_results_cri = ggvc_sim(go_optim_cri$fits[[1]], df_cri)
+cor_function(sim_results_cri$x_sim_gogarch, df_cri)
+cor_function(sim_results_cri$x_sim, df_cri)
+#corrplot_save("correlation_matrix_sim", cor_function(sim_results$x_sim, df_filtered)$cor_Xsim)
+```
+
+```{r}
+corrplot_save("correlation_matrix_df_cri_sim", cor_function(sim_results_cri$x_sim, df_cri)$cor_Xsim)
+corrplot_save("correlation_matrix_df_cri_raw", cor_function(sim_results_cri$x_sim, df_cri)$cor_Xraw)
+corrplot_save("correlation_matrix_df_cri_gogarchsim", cor_function(sim_results_cri$x_sim_gogarch, df_cri)$cor_Xsim)
+```
+
+```{r}
+go_optim_pos = gogarch_optim(go_garch_conditions[49,], df_pos)
+lb_test(go_optim_pos$fits[[1]], df_pos)
+
+sim_results_pos = ggvc_sim(go_optim_pos$fits[[1]], df_pos)
+cor_function(sim_results_pos$x_sim_gogarch, df_pos)
+cor_function(sim_results_pos$x_sim, df_pos)
+```
+
+```{r}
+corrplot_save("correlation_matrix_df_post_sim", cor_function(sim_results_pos$x_sim, df_pos)$cor_Xsim)
+corrplot_save("correlation_matrix_df_post_raw", cor_function(sim_results_pos$x_sim, df_pos)$cor_Xraw)
+corrplot_save("correlation_matrix_df_post_gogarchsim", cor_function(sim_results_pos$x_sim_gogarch, df_pos)$cor_Xsim)
+```
+
+# Weighted sum
+
+```{r}
+mental_crush = (exp(df_filtered)-1) %*% w
+```
+
+```{r}
+plot(dates[1:800], log(mental_crush[1:800]+1), type = "l", col = "darkorange")
+abline(h = 0, col = "red", lty = 2)
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted", lwd = 1)
+```
+
+```{r}
+roll_avg <- zoo::rollapply(
+  log(mental_crush+1),
+  width = 5,
+  FUN = mean,
+  fill = NA,
+  align = "right"
+)
+
+plot(dates, roll_avg, type='l', col="brown")
+abline(h = 0, col = "red", lty = 2)
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted", lwd = 1)
+```
+
+```{r}
+roll_avg <- zoo::rollapply(
+  log(mental_crush+1),
+  width = 30,
+  FUN = mean,
+  fill = NA,
+  align = "center"
+)
+
+plot(dates, roll_avg, type='l', col="brown")
+abline(h = 0, col = "red", lty = 2)
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted", lwd = 1)
+```
+
+```{r}
+roll_sd <- zoo::rollapply(
+  exp(mental_crush+1),
+  width = 30,
+  FUN = sd,
+  fill = NA,
+  align = "center"
+)
+
+plot(dates, roll_sd, type='l', col="blue")
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted", lwd = 1)
+```
+
+2021 H1 High-volatility
+
+2022 Q1 Pre-bust \
+2022 Q2 Crisis/bust\
+2022 Q3-Q4 Post-crisis
+
+# Additional Test based on Market Situations
+
+```{r}
+dates <- as.Date(rownames(df_filtered))
+
+# 1. High-volatility period (2021 H1)
+df_highvol <- df_filtered[
+  dates >= as.Date("2020-12-24") &
+  dates <= as.Date("2021-06-30"),
+]
+
+# 2. Pre-bust period (2022 Q1)
+df_prebust <- df_filtered[
+  dates >= as.Date("2021-12-20") &
+  dates <= as.Date("2022-04-08"),
+]
+
+# 3. Crisis / Bust period (2022 Q2)
+df_crisis <- df_filtered[
+  dates >= as.Date("2022-03-25") &
+  dates <= as.Date("2022-07-08"),
+]
+
+# 4. Post-crisis / prolonged-stress period (2022 Q3-Q4)
+df_postcrisis <- df_filtered[
+  dates >= as.Date("2022-06-24") &
+  dates <= as.Date("2022-12-31"),
+]
+```
+
+```{r}
+
+plot(
+  dates, roll_avg,
+  type = "n",
+  xlab = "",
+  ylab = "30-day Rolling Mean Log Return"
+)
+
+# pastel background
+usr <- par("usr")
+
+# 1. High-volatility period
+rect(
+  as.Date("2020-12-24"), usr[3],
+  as.Date("2021-06-30"), usr[4],
+  col = adjustcolor("lightblue", alpha.f = 0.4),
+  density = 15,
+  angle = 45,
+  border = "lightblue"
+)
+
+# 2. Pre-bust period
+rect(
+  as.Date("2022-01-01"), usr[3],
+  as.Date("2022-03-30"), usr[4],
+  col = adjustcolor("lightgreen", alpha.f = 0.5),
+  density = 15,
+  angle = -45,
+  border = "lightgreen"
+)
+
+# 3. Crisis / Bust period 
+rect(
+  as.Date("2022-04-01"), usr[3],
+  as.Date("2022-06-30"), usr[4],
+  col = adjustcolor("lightpink", alpha.f = 0.6),
+  density = 20,
+  angle = 0,
+  border = "lightpink"
+)
+
+# 4. Post-crisis / prolonged stress 
+rect(
+  as.Date("2022-07-01"), usr[3],
+  as.Date("2022-12-31"), usr[4],
+  col = adjustcolor("plum", alpha.f = 0.5),
+  density = 20,
+  angle = 90,
+  border = "plum"
+)
+
+# rolling average
+lines(
+  dates, roll_avg,
+  col = "gray28",
+  lwd = 1.5
+)
+
+# zero line
+abline(
+  h = 0,
+  col = "red",
+  lty = 2
+)
+
+grid(
+  nx = NULL,
+  ny = NULL,
+  col = "lightgray",
+  lty = "dotted",
+  lwd = 1
+)
+
+# Legend 
+legend(
+  "topright",
+  legend = c(
+    "High Volatility",
+    "Pre-bust",
+    "Crisis / Bust",
+    "Post-crisis"
+  ),
+  fill = c(
+    adjustcolor("lightblue", alpha.f = 0.4),
+    adjustcolor("lightgreen", alpha.f = 0.5),
+    adjustcolor("lightpink", alpha.f = 0.6),
+    adjustcolor("plum", alpha.f = 0.5)
+  ),
+  density = c(15, 15, 20, 20),
+  angle = c(45, -45, 0, 90),
+  border = c("lightblue", "lightgreen", "lightpink", "plum"),
+  bty = "n",
+  cex = 0.9
+)
+
+lines(
+  dates, roll_avg,
+  col = "gray28",
+  lwd = 1.5
+)
+
+box()
+
+
+
+```
+
+```{r}
+pdf(
+  "plots/market_periods_rolling_return.pdf",
+  width = 8,
+  height = 4.8
+)
+
+
+plot(
+  dates, roll_avg,
+  type = "n",
+  xlab = "",
+  ylab = "30-day Rolling Mean Log Return"
+)
+
+# pastel background
+usr <- par("usr")
+
+# 1. High-volatility period
+rect(
+  as.Date("2020-12-24"), usr[3],
+  as.Date("2021-06-30"), usr[4],
+  col = adjustcolor("lightblue", alpha.f = 0.4),
+  density = 15,
+  angle = 45,
+  border = "lightblue"
+)
+
+# 2. Pre-bust period
+rect(
+  as.Date("2022-01-01"), usr[3],
+  as.Date("2022-03-30"), usr[4],
+  col = adjustcolor("lightgreen", alpha.f = 0.5),
+  density = 15,
+  angle = -45,
+  border = "lightgreen"
+)
+
+# 3. Crisis / Bust period 
+rect(
+  as.Date("2022-04-01"), usr[3],
+  as.Date("2022-06-30"), usr[4],
+  col = adjustcolor("lightpink", alpha.f = 0.6),
+  density = 20,
+  angle = 0,
+  border = "lightpink"
+)
+
+# 4. Post-crisis / prolonged stress 
+rect(
+  as.Date("2022-07-01"), usr[3],
+  as.Date("2022-12-31"), usr[4],
+  col = adjustcolor("plum", alpha.f = 0.5),
+  density = 20,
+  angle = 90,
+  border = "plum"
+)
+
+# rolling average
+lines(
+  dates, roll_avg,
+  col = "gray28",
+  lwd = 1.5
+)
+
+# zero line
+abline(
+  h = 0,
+  col = "red",
+  lty = 2
+)
+
+grid(
+  nx = NULL,
+  ny = NULL,
+  col = "lightgray",
+  lty = "dotted",
+  lwd = 1
+)
+
+# Legend 
+legend(
+  "topright",
+  legend = c(
+    "High Volatility",
+    "Pre-bust",
+    "Crisis / Bust",
+    "Post-crisis"
+  ),
+  fill = c(
+    adjustcolor("lightblue", alpha.f = 0.4),
+    adjustcolor("lightgreen", alpha.f = 0.5),
+    adjustcolor("lightpink", alpha.f = 0.6),
+    adjustcolor("plum", alpha.f = 0.5)
+  ),
+  density = c(15, 15, 20, 20),
+  angle = c(45, -45, 0, 90),
+  border = c("lightblue", "lightgreen", "lightpink", "plum"),
+  bty = "n",
+  cex = 0.9
+)
+
+
+box()
+dev.off()
+```
+
+```{r}
+pdf(
+  "plots/market_periods_rolling_sd.pdf",
+  width = 8,
+  height = 4.8
+)
+
+
+plot(
+  dates, roll_sd,
+  type = "n",
+  xlab = "",
+  ylab = "30-day Rolling SD Log Return"
+)
+
+# pastel background
+usr <- par("usr")
+
+# 1. High-volatility period
+rect(
+  as.Date("2020-12-24"), usr[3],
+  as.Date("2021-06-30"), usr[4],
+  col = adjustcolor("lightblue", alpha.f = 0.4),
+  density = 15,
+  angle = 45,
+  border = "lightblue"
+)
+
+# 2. Pre-bust period
+rect(
+  as.Date("2022-01-01"), usr[3],
+  as.Date("2022-03-30"), usr[4],
+  col = adjustcolor("lightgreen", alpha.f = 0.5),
+  density = 15,
+  angle = -45,
+  border = "lightgreen"
+)
+
+# 3. Crisis / Bust period 
+rect(
+  as.Date("2022-04-01"), usr[3],
+  as.Date("2022-06-30"), usr[4],
+  col = adjustcolor("lightpink", alpha.f = 0.6),
+  density = 20,
+  angle = 0,
+  border = "lightpink"
+)
+
+# 4. Post-crisis / prolonged stress 
+rect(
+  as.Date("2022-07-01"), usr[3],
+  as.Date("2022-12-31"), usr[4],
+  col = adjustcolor("plum", alpha.f = 0.5),
+  density = 20,
+  angle = 90,
+  border = "plum"
+)
+
+# rolling average
+lines(
+  dates, roll_sd,
+  col = "darkblue",
+  lwd = 1.5
+)
+
+# zero line
+abline(
+  h = 0,
+  col = "red",
+  lty = 2
+)
+
+grid(
+  nx = NULL,
+  ny = NULL,
+  col = "lightgray",
+  lty = "dotted",
+  lwd = 1
+)
+
+# Legend 
+legend(
+  "topright",
+  legend = c(
+    "High Volatility",
+    "Pre-bust",
+    "Crisis / Bust",
+    "Post-crisis"
+  ),
+  fill = c(
+    adjustcolor("lightblue", alpha.f = 0.4),
+    adjustcolor("lightgreen", alpha.f = 0.5),
+    adjustcolor("lightpink", alpha.f = 0.6),
+    adjustcolor("plum", alpha.f = 0.5)
+  ),
+  density = c(15, 15, 20, 20),
+  angle = c(45, -45, 0, 90),
+  border = c("lightblue", "lightgreen", "lightpink", "plum"),
+  bty = "n",
+  cex = 0.9
+)
+
+
+box()
+
+
+dev.off()
+```
+
+```{r}
+period_analysis <- function(df, conditions) {
+  
+  # 1. GO-GARCH fitting
+  go_optim <- gogarch_optim(conditions, df)
+  
+  fit <- go_optim$fits[[1]]
+  
+  # 2. Ljung-Box test
+  lb <- lb_test(fit, df)
+  
+  # 3. Simulation
+  sim_results <- ggvc_sim(fit, df)
+  
+  # 4. Correlation comparison
+  cor_gogarch <- cor_function(
+    sim_results$x_sim_gogarch,
+    df
+  )
+  
+  cor_vine <- cor_function(
+    sim_results$x_sim,
+    df
+  )
+  
+  return(list(
+    optim = go_optim,
+    fit = fit,
+    lb_test = lb,
+    simulation = sim_results,
+    cor_gogarch = cor_gogarch,
+    cor_vine = cor_vine
+  ))
+}
+```
+
+```{r}
+df_list <- list(
+  highvol = df_highvol,
+  prebust = df_prebust,
+  crisis = df_crisis,
+  postcrisis = df_postcrisis
+)
+
+results <- lapply(
+  df_list,
+  period_analysis,
+  conditions = go_garch_conditions[49, ]
+)
+#corrplot_save("correlation_matrix_sim", cor_function(sim_results$x_sim, df_filtered)$cor_Xsim)
+```
+
+```{r}
+results$highvol$cor_vine$rmse
+results$highvol$cor_vine$mae
+results$highvol$cor_gogarch$rmse
+results$highvol$cor_gogarch$mae
+```
+
+```{r}
+results_table <- data.frame(
+  Period = c(
+    rep("Full Sample", 4),
+    rep("High Volatility", 4),
+    rep("Pre-bust", 4),
+    rep("Crisis", 4),
+    rep("Post-crisis", 4)
+  ),
+  
+  Model = c(
+    "GO-GARCH", "GO-GARCH",
+    "Vine Copula", "Vine Copula",
+    
+    "GO-GARCH", "GO-GARCH",
+    "Vine Copula", "Vine Copula",
+    
+    "GO-GARCH", "GO-GARCH",
+    "Vine Copula", "Vine Copula",
+    
+    "GO-GARCH", "GO-GARCH",
+    "Vine Copula", "Vine Copula",
+    
+    "GO-GARCH", "GO-GARCH",
+    "Vine Copula", "Vine Copula"
+  ),
+  
+  Metric = c(
+    "RMSE", "MAE", "RMSE", "MAE",
+    "RMSE", "MAE", "RMSE", "MAE",
+    "RMSE", "MAE", "RMSE", "MAE",
+    "RMSE", "MAE", "RMSE", "MAE",
+    "RMSE", "MAE", "RMSE", "MAE"
+  ),
+  
+  Value = c(
+    # Full sample
+    cor_function(sim_results$x_sim_gogarch, df_filtered)$rmse,
+    cor_function(sim_results$x_sim_gogarch, df_filtered)$mae,
+    cor_function(sim_results$x_sim, df_filtered)$rmse,
+    cor_function(sim_results$x_sim, df_filtered)$mae,
+    
+    # High volatility
+    results$highvol$cor_gogarch$rmse,
+    results$highvol$cor_gogarch$mae,
+    results$highvol$cor_vine$rmse,
+    results$highvol$cor_vine$mae,
+    
+    # Pre-bust
+    results$prebust$cor_gogarch$rmse,
+    results$prebust$cor_gogarch$mae,
+    results$prebust$cor_vine$rmse,
+    results$prebust$cor_vine$mae,
+    
+    # Crisis
+    results$crisis$cor_gogarch$rmse,
+    results$crisis$cor_gogarch$mae,
+    results$crisis$cor_vine$rmse,
+    results$crisis$cor_vine$mae,
+    
+    # Post-crisis
+    results$postcrisis$cor_gogarch$rmse,
+    results$postcrisis$cor_gogarch$mae,
+    results$postcrisis$cor_vine$rmse,
+    results$postcrisis$cor_vine$mae
+  )
+)
+
+results_table
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+results_wide <- results_table %>%
+  mutate(
+    Model_Metric = paste(Metric, Model)
+  ) %>%
+  select(Period, Model_Metric, Value) %>%
+  pivot_wider(
+    names_from = Model_Metric,
+    values_from = Value
+  )
+
+results_wide
+```
+
+```{r}
+sim_list <- list(
+  highvol    = results$highvol$simulation,
+  prebust    = results$prebust$simulation,
+  crisis     = results$crisis$simulation,
+  postcrisis = results$postcrisis$simulation
+)
+
+df_list <- list(
+  highvol    = df_highvol,
+  prebust    = df_prebust,
+  crisis     = df_crisis,
+  postcrisis = df_postcrisis
+)
+```
+
+```{r}
+for (period in names(df_list)) {
+  
+  df <- df_list[[period]]
+  sim <- sim_list[[period]]
+  
+  # 1. Raw data
+  cor_raw <- cor(df, use = "pairwise.complete.obs")
+  
+  corrplot_save(
+    filename = paste0("corr_", period, "_raw"),
+    cor_matrix = cor_raw
+  )
+  
+  
+  # 2. GO-GARCH
+  cor_gogarch <- cor(sim$x_sim_gogarch,use = "pairwise.complete.obs")
+
+  corrplot_save(
+    filename = paste0("corr_", period, "_gogarch"),
+    cor_matrix = cor_gogarch
+  )
+  
+  
+  # 3. Vine + GO-GARCH
+  cor_vine <- cor(sim$x_sim, use = "pairwise.complete.obs")
+  
+  corrplot_save(
+    filename = paste0("corr_", period, "_vine"),
+    cor_matrix = cor_vine
+  )
+}
+```
+
+```{r}
+cor1 = cor(df_prebust,use = "pairwise.complete.obs")
+cor2 = cor(sim_list$prebust$x_sim_gogarch,use = "pairwise.complete.obs")
+cor3 = cor(sim_list$prebust$x_sim,use = "pairwise.complete.obs")
+
+
+sqrt(colSums((cor2-cor1)^2)/9)
+sqrt(colSums((cor3-cor1)^2)/9)
 ```
